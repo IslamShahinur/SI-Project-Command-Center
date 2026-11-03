@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SI Project Command Center</title>
+<?!= include('Styles'); ?>
+</head>
+<body>
+<header class="top">
+  <button class="brand" data-a="home">SI Project Command Center</button>
+  <input id="q" type="search" placeholder="Search everything…  (press / )" aria-label="Search">
+  <span class="grow"></span>
+  <a id="sheetLink" class="btn" target="_blank" rel="noopener" hidden>Open data sheet</a>
+  <button class="btn" data-a="refresh">Refresh</button>
+  <button class="btn primary" data-a="newProject">New project</button>
+</header>
+<main id="app" class="wrap"><div class="empty">Loading your projects…</div></main>
+<div id="toasts" aria-live="polite"></div>
+<?!= include('JavaScript'); ?>
+</body>
+</html>

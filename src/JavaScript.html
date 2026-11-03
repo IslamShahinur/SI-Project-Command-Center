@@ -1,0 +1,318 @@
+<script>
+(function () {
+'use strict';
+const $ = (s, el) => (el || document).querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const TYPES = ['WordPress Plugin', 'PHP App', 'Website', 'Python', 'React / JS', 'Google Apps Script', 'Other'];
+const STATUS = ['Planning', 'Active', 'Blocked', 'On hold', 'Done'];
+const PRIORITY = ['High', 'Medium', 'Low'];
+const LEVELS = ['Critical', 'High', 'Medium', 'Low'];
+const DOC_CATS = ['Blueprint', 'Core document', 'Audit / report', 'Pending register', 'Deferred register', 'Other'];
+const ISTATUS = { phase: ['Planned', 'Next', 'Current', 'Done'], problem: ['Open', 'Resolved'], pending: ['Open', 'Done'], deferred: ['Deferred', 'Dropped'], note: [''] };
+const DONE = ['Done', 'Resolved', 'Dropped'];
+const KIND = {
+  phase: { tab: 'phases', label: 'Phases', add: 'Add phase', empty: 'No phases yet. Add your roadmap and mark the one you are on as Current.', t: 'Phase name', d: 'What this phase covers' },
+  problem: { tab: 'problems', label: 'Problems', add: 'Add problem', empty: 'No problems recorded.', t: 'Problem', d: 'Details, error messages, where it happens' },
+  pending: { tab: 'pending', label: 'Pending', add: 'Add pending item', empty: 'Nothing pending.', t: 'What needs to be done', d: 'Details' },
+  deferred: { tab: 'deferred', label: 'Deferred', add: 'Add deferred item', empty: 'Nothing deferred.', t: 'What was deferred', d: 'Why it was deferred and when to revisit' },
+  note: { tab: 'notes', label: 'Notes', add: 'Add note', empty: 'No notes yet.', t: 'Title (optional)', d: 'Note' }
+};
+const TABS = [['overview', 'Overview'], ['phases', 'Phases'], ['problems', 'Problems'], ['pending', 'Pending'], ['deferred', 'Deferred'], ['notes', 'Notes'], ['docs', 'Documents']];
+let DB = { projects: [], items: [], docs: [], maxMb: 15 };
+let ui = { page: 'home', pid: null, tab: 'overview', filter: 'All', q: '' };
+
+/* ---------- helpers ---------- */
+function api(fn) {
+  const args = Array.prototype.slice.call(arguments, 1);
+  return new Promise((ok, fail) => {
+    const r = google.script.run.withSuccessHandler(ok).withFailureHandler(e => fail(new Error((e && e.message) || String(e))));
+    r[fn].apply(r, args);
+  });
+}
+const put = (list, o) => { const i = list.findIndex(x => x.id === o.id); if (i >= 0) list[i] = o; else list.push(o); return o; };
+const pById = id => DB.projects.find(p => p.id === id);
+const itemsOf = (pid, kind) => DB.items.filter(i => i.projectId === pid && i.kind === kind);
+const isDone = i => DONE.indexOf(i.status) >= 0;
+const phases = pid => itemsOf(pid, 'phase').sort((a, b) => a.sort - b.sort);
+const touch = pid => { const p = pById(pid); if (p) p.updatedAt = new Date().toISOString(); };
+const safeUrl = u => /^https?:\/\//i.test(u) ? u : '#';
+function ago(iso) {
+  const t = new Date(iso).getTime(); if (isNaN(t)) return '—';
+  const m = Math.floor((Date.now() - t) / 60000);
+  if (m < 1) return 'just now'; if (m < 60) return m + ' min ago';
+  const h = Math.floor(m / 60); if (h < 24) return h + ' h ago';
+  const d = Math.floor(h / 24); if (d < 30) return d + (d > 1 ? ' days ago' : ' day ago');
+  return new Date(t).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+const daysSince = iso => Math.floor((Date.now() - new Date(iso).getTime()) / 864e5);
+const size = n => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+function toast(msg, bad) {
+  const t = document.createElement('div'); t.className = 'toast' + (bad ? ' bad' : ''); t.textContent = msg;
+  $('#toasts').appendChild(t); setTimeout(() => t.remove(), bad ? 6000 : 2500);
+}
+const run = (p, ok) => p.then(r => { if (ok) toast(ok); render(); return r; }).catch(e => toast(e.message, true));
+const badge = v => v ? `<span class="badge s-${esc(v).replace(/\s/g, "")}">${esc(v)}</span>` : '';
+
+/* ---------- modals ---------- */
+function modal(html) {
+  const el = document.createElement('div'); el.className = 'overlay';
+  el.innerHTML = `<div class="modal" role="dialog" aria-modal="true">${html}</div>`;
+  document.body.appendChild(el);
+  return { el, close: () => el.remove() };
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { const o = document.querySelectorAll('.overlay'); if (o.length) o[o.length - 1].remove(); }
+  if (e.key === '/' && !/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) { e.preventDefault(); $('#q').focus(); }
+  if (e.key === 'Enter' && e.target.matches('[data-a][tabindex]')) e.target.click();
+});
+function fieldHtml(f) {
+  const v = f.value == null ? '' : f.value, n = esc(f.k);
+  let inp;
+  if (f.type === 'textarea') inp = `<textarea name="${n}" rows="${f.rows || 4}">${esc(v)}</textarea>`;
+  else if (f.type === 'select') inp = `<select name="${n}">${f.options.map(o => { const a = Array.isArray(o) ? o : [o, o]; return `<option value="${esc(a[0])}"${String(a[0]) === String(v) ? ' selected' : ''}>${esc(a[1])}</option>`; }).join('')}</select>`;
+  else inp = `<input name="${n}" type="${f.type || 'text'}" value="${esc(v)}"${f.type === 'file' ? '' : ''}>`;
+  return `<label class="field"><span>${esc(f.label)}${f.required ? ' *' : ''}</span>${inp}</label>`;
+}
+function form(o) {
+  const m = modal(`<form novalidate><h2>${esc(o.title)}</h2>${o.fields.map(fieldHtml).join('')}<div class="err" hidden></div><div class="actions"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" type="submit">${esc(o.submit || 'Save')}</button></div></form>`);
+  const f = $('form', m.el), err = $('.err', m.el), btn = $('button[type=submit]', f);
+  m.el.addEventListener('click', e => { if (e.target.closest('[data-close]')) m.close(); });
+  f.addEventListener('submit', async e => {
+    e.preventDefault();
+    const vals = {};
+    for (const fd of o.fields) {
+      const el = f.querySelector('[name="' + fd.k + '"]');
+      vals[fd.k] = fd.type === 'file' ? el.files[0] : el.value;
+      if (fd.required && (fd.type === 'file' ? !vals[fd.k] : !String(vals[fd.k]).trim())) { err.hidden = false; err.textContent = fd.label + ' is required.'; return; }
+    }
+    const old = btn.textContent; btn.disabled = true; btn.textContent = o.busy || 'Saving…'; err.hidden = true;
+    try { await o.onSubmit(vals); m.close(); render(); }
+    catch (ex) { err.hidden = false; err.textContent = ex.message; btn.disabled = false; btn.textContent = old; }
+  });
+  const first = f.querySelector('input,textarea,select'); if (first) first.focus();
+}
+function confirmBox(msg, label) {
+  return new Promise(res => {
+    const m = modal(`<h2>Are you sure?</h2><p>${esc(msg)}</p><div class="actions"><button class="btn" data-n>Cancel</button><button class="btn danger solid" data-y>${esc(label || 'Delete')}</button></div>`);
+    m.el.addEventListener('click', e => { const y = e.target.closest('[data-y]'), n = e.target.closest('[data-n]'); if (y || n) { m.close(); res(!!y); } });
+  });
+}
+function readB64(file) {
+  return new Promise((ok, fail) => {
+    if (file.size > DB.maxMb * 1048576) return fail(new Error('File is larger than ' + DB.maxMb + ' MB.'));
+    const r = new FileReader();
+    r.onload = () => { const s = String(r.result); ok(s.slice(s.indexOf(',') + 1)); };
+    r.onerror = () => fail(new Error('Could not read the file.'));
+    r.readAsDataURL(file);
+  });
+}
+
+/* ---------- views ---------- */
+function render() {
+  const app = $('#app');
+  if (ui.q.trim()) app.innerHTML = searchView();
+  else if (ui.page === 'project' && pById(ui.pid)) app.innerHTML = projectView(pById(ui.pid));
+  else { ui.page = 'home'; app.innerHTML = homeView(); }
+}
+function rowsHtml(rows) {
+  return rows.map(r => `<div class="item hit" tabindex="0" data-a="open" data-id="${esc(r[0])}" data-tab="${r[1]}"><div><div class="t">${esc(r[3])} ${badge(r[2])}</div>${r[4] ? `<div class="x">${esc(r[4])}</div>` : ''}</div></div>`).join('');
+}
+function searchView() {
+  const q = ui.q.trim().toLowerCase(), hit = function () { return Array.prototype.some.call(arguments, s => String(s || '').toLowerCase().includes(q)); };
+  const rows = [];
+  DB.projects.filter(p => hit(p.name, p.description, p.stack, p.state, p.nextAction, p.constraints)).forEach(p => rows.push([p.id, 'overview', 'Project', p.name, p.description]));
+  DB.items.filter(i => hit(i.title, i.details) && pById(i.projectId)).forEach(i => rows.push([i.projectId, KIND[i.kind].tab, KIND[i.kind].label, i.title || i.details.slice(0, 80), pById(i.projectId).name]));
+  DB.docs.filter(d => hit(d.name, d.note) && pById(d.projectId)).forEach(d => rows.push([d.projectId, 'docs', 'Document', d.name, pById(d.projectId).name]));
+  return `<h2>${rows.length} result${rows.length === 1 ? '' : 's'} for “${esc(ui.q.trim())}”</h2>${rows.length ? rowsHtml(rows.slice(0, 60)) : '<div class="empty">Nothing matches. Try a different word.</div>'}`;
+}
+function homeView() {
+  const live = DB.projects.filter(p => !p.archived), ids = new Set(live.map(p => p.id));
+  const open = k => DB.items.filter(i => i.kind === k && !isDone(i) && ids.has(i.projectId)).length;
+  const stats = [['Active', live.filter(p => p.status === 'Active').length], ['Blocked', live.filter(p => p.status === 'Blocked').length],
+    ['Open problems', open('problem')], ['Pending', open('pending')], ['Deferred', open('deferred')]];
+  const att = live.filter(p => p.status === 'Blocked').map(p => [p.id, 'overview', 'Blocked', p.name, p.nextAction]);
+  DB.items.filter(i => i.kind === 'problem' && !isDone(i) && ids.has(i.projectId) && (i.level === 'Critical' || i.level === 'High')).forEach(i => att.push([i.projectId, 'problems', i.level, i.title, pById(i.projectId).name]));
+  const chips = ['All'].concat(STATUS, ['Archived']);
+  const list = DB.projects.filter(p => ui.filter === 'Archived' ? p.archived : (!p.archived && (ui.filter === 'All' || p.status === ui.filter)))
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  return `<div class="stats">${stats.map(s => `<div class="stat"><b>${s[1]}</b><span>${s[0]}</span></div>`).join('')}</div>
+  ${att.length ? `<div class="panel"><h3>Needs attention</h3>${rowsHtml(att.slice(0, 6))}</div>` : ''}
+  <div class="chips">${chips.map(c => `<button class="chip" data-a="filter" data-v="${c}" aria-pressed="${ui.filter === c}">${c}</button>`).join('')}</div>
+  ${list.length ? `<div class="grid">${list.map(card).join('')}</div>` : `<div class="empty">${DB.projects.length ? 'No projects in this view.' : 'No projects yet. Click “New project” to add your first one.'}</div>`}`;
+}
+function card(p) {
+  const ph = phases(p.id), cur = ph.find(x => x.status === 'Current'), nxt = ph.find(x => x.status === 'Next');
+  const op = k => itemsOf(p.id, k).filter(i => !isDone(i)).length;
+  const stale = p.status !== 'Done' && daysSince(p.updatedAt) >= 14;
+  return `<article class="card" tabindex="0" data-a="open" data-id="${esc(p.id)}">
+    <div class="name">${esc(p.name)}</div>
+    <div class="row">${badge(p.status)}<span class="badge">${esc(p.priority)} priority</span><span class="badge">${esc(p.type)}</span></div>
+    <div class="small"><span class="dim">Now:</span> ${esc(cur ? cur.title : 'not set')}<br><span class="dim">Next:</span> ${esc(nxt ? nxt.title : 'not set')}</div>
+    ${p.nextAction ? `<div class="small"><span class="dim">Next action:</span> ${esc(p.nextAction)}</div>` : ''}
+    <div class="small dim">${op('problem')} problems · ${op('pending')} pending · ${op('deferred')} deferred</div>
+    <div class="small ${stale ? 'stale' : 'dim'}">${stale ? 'Not touched for ' + daysSince(p.updatedAt) + ' days' : 'Updated ' + ago(p.updatedAt)}</div></article>`;
+}
+function projectView(p) {
+  const body = ui.tab === 'overview' ? overview(p) : ui.tab === 'docs' ? docsTab(p) : itemsTab(p, Object.keys(KIND).find(k => KIND[k].tab === ui.tab));
+  return `<button class="btn sm" data-a="home">‹ All projects</button>
+  <div class="row" style="margin:.8rem 0"><h1 style="margin:0;font-size:1.5rem">${esc(p.name)}</h1>${badge(p.status)}${p.archived ? '<span class="badge">Archived</span>' : ''}<span class="grow"></span>
+    <button class="btn sm" data-a="brief">Resume brief</button>
+    <button class="btn sm" data-a="editProject">Edit details</button>
+    <button class="btn sm" data-a="archive">${p.archived ? 'Restore' : 'Archive'}</button></div>
+  <div class="tabs" role="tablist">${TABS.map(t => `<button class="tab" role="tab" data-a="tab" data-v="${t[0]}" aria-selected="${ui.tab === t[0]}">${t[1]}</button>`).join('')}</div>${body}`;
+}
+function overview(p) {
+  const ph = phases(p.id), done = ph.filter(x => x.status === 'Done').length, cur = ph.find(x => x.status === 'Current'), nxt = ph.find(x => x.status === 'Next');
+  const pinned = itemsOf(p.id, 'note').filter(n => n.level === 'Pinned');
+  const kv = (k, v) => v ? `<div class="small"><span class="dim">${k}:</span> ${v}</div>` : '';
+  return `<div class="two"><div class="panel"><h3>Current phase</h3><div>${esc(cur ? cur.title : 'Not set')}</div></div>
+    <div class="panel"><h3>Next phase</h3><div>${esc(nxt ? nxt.title : 'Not set')}</div></div></div>
+  ${ph.length ? `<div class="panel"><h3>${done} of ${ph.length} phases done</h3><div class="bar"><i style="width:${Math.round(done / ph.length * 100)}%"></i></div></div>` : ''}
+  <form class="panel" id="quick"><h3>Quick update</h3>
+    <div class="two">${fieldHtml({ k: 'status', label: 'Status', type: 'select', options: STATUS, value: p.status })}${fieldHtml({ k: 'priority', label: 'Priority', type: 'select', options: PRIORITY, value: p.priority })}</div>
+    ${fieldHtml({ k: 'state', label: 'Where I left off', type: 'textarea', value: p.state })}
+    ${fieldHtml({ k: 'nextAction', label: 'Next action', value: p.nextAction })}
+    <button class="btn primary">Save update</button></form>
+  <div class="panel"><h3>Details</h3>${kv('Description', esc(p.description))}${kv('Type', esc(p.type))}${kv('Stack', esc(p.stack))}
+    ${kv('Repository', p.repo ? `<a href="${esc(safeUrl(p.repo))}" target="_blank" rel="noopener">${esc(p.repo)}</a>` : '')}${kv('Local folder', p.localPath ? `<span class="path">${esc(p.localPath)}</span>` : '')}
+    ${kv('Constraints', esc(p.constraints))}${kv('Created', ago(p.createdAt))}</div>
+  ${pinned.length ? `<div class="panel"><h3>Pinned notes</h3>${pinned.map(itemRow).join('')}</div>` : ''}
+  ${p.archived ? `<div class="panel" style="border-color:var(--bad)"><h3>Danger zone</h3><p class="small dim">Deleting removes this project, its phases, problems, registers, notes and documents. Files move to the Drive trash.</p><button class="btn danger" data-a="deleteProject">Delete project…</button></div>` : '<p class="small dim">To delete this project, archive it first.</p>'}`;
+}
+function itemsTab(p, kind) {
+  const K = KIND[kind], all = itemsOf(p.id, kind), rank = i => LEVELS.indexOf(i.level);
+  let open = all.filter(i => !isDone(i)), closed = all.filter(isDone);
+  if (kind === 'phase') { open = all.slice().sort((a, b) => a.sort - b.sort); closed = []; }
+  else if (kind === 'note') open.sort((a, b) => (b.level === 'Pinned') - (a.level === 'Pinned') || String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  else open.sort((a, b) => rank(a) - rank(b) || String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  closed.sort((a, b) => String(b.doneAt).localeCompare(String(a.doneAt)));
+  return `<div class="row" style="margin-bottom:.8rem"><h2 style="margin:0">${K.label}</h2><span class="grow"></span><button class="btn primary" data-a="addItem" data-k="${kind}">${K.add}</button></div>
+  ${open.length ? open.map(itemRow).join('') : `<div class="empty">${K.empty}</div>`}
+  ${closed.length ? `<details><summary>Closed (${closed.length})</summary>${closed.map(itemRow).join('')}</details>` : ''}`;
+}
+function itemRow(i) {
+  const id = `data-id="${esc(i.id)}"`, k = i.kind, done = isDone(i);
+  const b = (a, t) => `<button class="btn sm" data-a="${a}" ${id}>${t}</button>`;
+  let acts = '';
+  if (k === 'phase') acts = `<button class="btn sm" data-a="up" ${id} aria-label="Move up">↑</button><button class="btn sm" data-a="down" ${id} aria-label="Move down">↓</button><select data-phase ${id} aria-label="Phase status">${ISTATUS.phase.map(s => `<option${s === i.status ? ' selected' : ''}>${s}</option>`).join('')}</select>`;
+  if (k === 'problem') acts = b('toggle', done ? 'Reopen' : 'Mark resolved');
+  if (k === 'pending') acts = b('toggle', done ? 'Reopen' : 'Mark done') + (done ? '' : b('toDeferred', 'Defer'));
+  if (k === 'deferred') acts = b('toPending', 'Move to pending') + b('toggle', done ? 'Restore' : 'Drop');
+  if (k === 'note') acts = b('pin', i.level === 'Pinned' ? 'Unpin' : 'Pin');
+  return `<div class="item ${done ? 'done' : ''}"><div><div class="t">${k === 'phase' ? esc(i.sort) + '. ' : ''}${esc(i.title || 'Note')} ${(k === 'problem' || k === 'pending') ? badge(i.level) : ''}${k === 'note' && i.level === 'Pinned' ? '<span class="badge">Pinned</span>' : ''}</div>
+    ${i.details ? `<div class="x">${esc(i.details)}</div>` : ''}<div class="small dim">Updated ${ago(i.updatedAt)}${i.doneAt ? ' · closed ' + ago(i.doneAt) : ''}</div></div>
+    <div class="acts">${acts}${b('editItem', 'Edit')}${b('delItem', 'Delete')}</div></div>`;
+}
+function docsTab(p) {
+  const docs = DB.docs.filter(d => d.projectId === p.id).sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
+  return `<div class="row" style="margin-bottom:.8rem"><h2 style="margin:0">Documents</h2><span class="grow"></span><button class="btn" data-a="addLink">Add link</button><button class="btn primary" data-a="upload">Upload file</button></div>
+  ${docs.length ? docs.map(d => `<div class="item"><div><div class="t"><a href="${esc(safeUrl(d.url))}" target="_blank" rel="noopener">${esc(d.name)}</a> <span class="badge">${esc(d.category)}</span></div>
+    ${d.note ? `<div class="x">${esc(d.note)}</div>` : ''}<div class="small dim">${d.fileId ? size(d.size) : 'Link'} · updated ${ago(d.updatedAt)}</div></div>
+    <div class="acts">${d.fileId ? `<button class="btn sm" data-a="replaceDoc" data-id="${esc(d.id)}">Replace file</button>` : ''}<button class="btn sm" data-a="editDoc" data-id="${esc(d.id)}">Edit info</button><button class="btn sm" data-a="delDoc" data-id="${esc(d.id)}">Delete</button></div></div>`).join('')
+    : `<div class="empty">No documents yet. Upload blueprints, specs, audit reports and registers.</div>`}
+  <p class="small dim">Files are stored privately in your Google Drive. Deleted or replaced files go to the Drive trash, so you can still recover them.</p>`;
+}
+
+/* ---------- actions ---------- */
+const projectFields = p => [
+  { k: 'name', label: 'Project name', required: true, value: p.name }, { k: 'type', label: 'Type', type: 'select', options: TYPES, value: p.type || 'Other' },
+  { k: 'status', label: 'Status', type: 'select', options: STATUS, value: p.status || 'Active' }, { k: 'priority', label: 'Priority', type: 'select', options: PRIORITY, value: p.priority || 'Medium' },
+  { k: 'description', label: 'Short description', type: 'textarea', rows: 2, value: p.description }, { k: 'stack', label: 'Technology stack', value: p.stack },
+  { k: 'repo', label: 'Repository URL', value: p.repo }, { k: 'localPath', label: 'Local folder path', value: p.localPath },
+  { k: 'constraints', label: 'Important constraints', type: 'textarea', rows: 3, value: p.constraints },
+  { k: 'state', label: 'Where I left off', type: 'textarea', rows: 3, value: p.state }, { k: 'nextAction', label: 'Next action', value: p.nextAction }];
+const cur = () => pById(ui.pid);
+const item = id => DB.items.find(i => i.id === id), doc = id => DB.docs.find(d => d.id === id);
+const saveItem = o => api('saveItem', o).then(r => { put(DB.items, r); touch(r.projectId); return r; });
+function mv(d, dir) {
+  const i = item(d.id), ph = phases(i.projectId), x = ph.findIndex(y => y.id === i.id), y = x + dir;
+  if (y < 0 || y >= ph.length) return;
+  ph.splice(y, 0, ph.splice(x, 1)[0]);
+  run(Promise.all(ph.map((q, n) => q.sort !== n + 1 ? saveItem({ id: q.id, sort: n + 1 }) : null).filter(Boolean)));
+}
+const A = {
+  home: () => { ui.page = 'home'; render(); window.scrollTo(0, 0); },
+  refresh: () => run(api('getData').then(d => { DB = d; }), 'Refreshed'),
+  filter: d => { ui.filter = d.v; render(); },
+  tab: d => { ui.tab = d.v; render(); },
+  open: d => { ui.q = ''; $('#q').value = ''; ui.page = 'project'; ui.pid = d.id; ui.tab = d.tab || 'overview'; render(); window.scrollTo(0, 0); },
+  newProject: () => form({ title: 'New project', fields: projectFields({}), submit: 'Create project',
+    onSubmit: async v => { const r = await api('saveProject', v); put(DB.projects, r); ui.page = 'project'; ui.pid = r.id; ui.tab = 'overview'; } }),
+  editProject: () => form({ title: 'Edit project', fields: projectFields(cur()), onSubmit: async v => { v.id = cur().id; put(DB.projects, await api('saveProject', v)); } }),
+  archive: () => run(api('saveProject', { id: cur().id, archived: cur().archived ? '' : 'yes' }).then(r => { put(DB.projects, r); if (r.archived) ui.page = 'home'; }), 'Done'),
+  deleteProject: () => {
+    const p = cur();
+    form({ title: 'Delete project permanently', submit: 'Delete project', fields: [{ k: 'confirm', label: 'Type the project name to confirm: ' + p.name, required: true }],
+      onSubmit: async v => {
+        if (v.confirm.trim() !== p.name) throw new Error('The name does not match.');
+        await api('deleteProject', p.id);
+        DB.projects = DB.projects.filter(x => x.id !== p.id); DB.items = DB.items.filter(x => x.projectId !== p.id); DB.docs = DB.docs.filter(x => x.projectId !== p.id);
+        ui.page = 'home'; toast('Project deleted');
+      } });
+  },
+  up: d => mv(d, -1), down: d => mv(d, 1),
+  brief: () => {
+    const p = cur(), ph = phases(p.id), open = k => itemsOf(p.id, k).filter(i => !isDone(i));
+    const list = (arr, f) => arr.length ? arr.map(f).join('\n') : '- (none recorded)';
+    const cp = ph.find(x => x.status === 'Current'), np = ph.find(x => x.status === 'Next');
+    const txt = ['# Project: ' + p.name, 'Type: ' + p.type + ' | Status: ' + p.status + ' | Priority: ' + p.priority, p.stack ? 'Stack: ' + p.stack : null, p.repo ? 'Repo: ' + p.repo : null, p.localPath ? 'Local folder: ' + p.localPath : null,
+      '', '## Description', p.description || '(not recorded)', '', '## Where I left off', p.state || '(not recorded)', '',
+      '## Current phase: ' + (cp ? cp.title : '(not set)'), 'Next phase: ' + (np ? np.title : '(not set)'), 'Next action: ' + (p.nextAction || '(not set)'), '',
+      '## Constraints', p.constraints || '(none recorded)', '', '## Phases', list(ph, x => '- [' + (x.status === 'Done' ? 'x' : ' ') + '] ' + x.sort + '. ' + x.title + ' (' + x.status + ')'), '',
+      '## Open problems', list(open('problem'), x => '- [' + x.level + '] ' + x.title + (x.details ? ': ' + x.details : '')), '',
+      '## Pending', list(open('pending'), x => '- [' + x.level + '] ' + x.title + (x.details ? ': ' + x.details : '')), '',
+      '## Deferred', list(open('deferred'), x => '- ' + x.title + (x.details ? ': ' + x.details : '')), '',
+      '## Pinned notes', list(itemsOf(p.id, 'note').filter(n => n.level === 'Pinned'), x => '- ' + (x.title ? x.title + ': ' : '') + x.details), '',
+      '## Key documents', list(DB.docs.filter(d => d.projectId === p.id), x => '- ' + x.name + ' (' + x.category + ')')].filter(x => x !== null).join('\n');
+    const m = modal(`<h2>Resume brief</h2><p class="small dim">Paste this into a new AI chat to continue where you stopped.</p><textarea rows="16" readonly>${esc(txt)}</textarea><div class="actions"><button class="btn" data-close>Close</button><button class="btn primary" data-copy>Copy to clipboard</button></div>`);
+    m.el.addEventListener('click', e => {
+      if (e.target.closest('[data-close]')) m.close();
+      if (e.target.closest('[data-copy]')) { const t = $('textarea', m.el); t.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (x) {} toast(ok ? 'Copied' : 'Press Ctrl+C to copy', !ok); }
+    });
+  },
+  addLink: () => form({ title: 'Add a link', fields: [{ k: 'url', label: 'Link (Google Doc, GitHub, etc.)', required: true }, { k: 'name', label: 'Name' },
+    { k: 'category', label: 'Category', type: 'select', options: DOC_CATS, value: 'Core document' }, { k: 'note', label: 'Note', type: 'textarea', rows: 2 }],
+    onSubmit: async v => { put(DB.docs, await api('addLink', Object.assign(v, { projectId: ui.pid }))); touch(ui.pid); } }),
+  addItem: d => {
+    const K = KIND[d.k], f = [{ k: 'title', label: K.t, required: d.k !== 'note' }, { k: 'details', label: K.d, type: 'textarea', required: d.k === 'note' }];
+    if (d.k === 'phase') f.push({ k: 'status', label: 'Status', type: 'select', options: ISTATUS.phase, value: 'Planned' });
+    if (d.k === 'problem' || d.k === 'pending') f.push({ k: 'level', label: d.k === 'problem' ? 'Severity' : 'Priority', type: 'select', options: LEVELS, value: 'Medium' });
+    if (d.k === 'note') f.push({ k: 'level', label: 'Pin to overview?', type: 'select', options: [['', 'No'], ['Pinned', 'Yes']] });
+    form({ title: K.add, fields: f, onSubmit: v => saveItem(Object.assign(v, { projectId: ui.pid, kind: d.k })) });
+  },
+  editItem: d => {
+    const i = item(d.id), K = KIND[i.kind], f = [{ k: 'title', label: K.t, value: i.title, required: i.kind !== 'note' }, { k: 'details', label: K.d, type: 'textarea', value: i.details, required: i.kind === 'note' }];
+    if (i.kind === 'phase') f.push({ k: 'sort', label: 'Order (1 = first)', type: 'number', value: i.sort }, { k: 'status', label: 'Status', type: 'select', options: ISTATUS.phase, value: i.status });
+    if (i.kind === 'problem' || i.kind === 'pending') f.push({ k: 'level', label: i.kind === 'problem' ? 'Severity' : 'Priority', type: 'select', options: LEVELS, value: i.level });
+    form({ title: 'Edit ' + i.kind, fields: f, onSubmit: v => { v.id = i.id; return saveItem(v); } });
+  },
+  delItem: async d => { if (await confirmBox('Delete this item permanently?')) run(api('deleteItem', d.id).then(() => { DB.items = DB.items.filter(i => i.id !== d.id); }), 'Deleted'); },
+  toggle: d => { const i = item(d.id), s = ISTATUS[i.kind]; run(saveItem({ id: i.id, status: isDone(i) ? s[0] : s[1] })); },
+  toDeferred: d => run(saveItem({ id: d.id, kind: 'deferred', status: 'Deferred' }), 'Moved to deferred'),
+  toPending: d => run(saveItem({ id: d.id, kind: 'pending', status: 'Open' }), 'Moved to pending'),
+  pin: d => { const i = item(d.id); run(saveItem({ id: i.id, level: i.level === 'Pinned' ? '' : 'Pinned' })); },
+  upload: () => form({ title: 'Upload a document', submit: 'Upload', busy: 'Uploading…', fields: [{ k: 'file', label: 'File (max ' + DB.maxMb + ' MB)', type: 'file', required: true },
+    { k: 'name', label: 'Display name (optional)' }, { k: 'category', label: 'Category', type: 'select', options: DOC_CATS, value: 'Blueprint' }, { k: 'note', label: 'Note', type: 'textarea', rows: 2 }],
+    onSubmit: async v => { const b64 = await readB64(v.file); const r = await api('uploadDoc', { projectId: ui.pid, fileName: v.file.name, mimeType: v.file.type, base64: b64, name: v.name, category: v.category, note: v.note }); put(DB.docs, r); touch(ui.pid); } }),
+  replaceDoc: d => form({ title: 'Replace file', submit: 'Replace', busy: 'Uploading…', fields: [{ k: 'file', label: 'New file for “' + doc(d.id).name + '”', type: 'file', required: true }],
+    onSubmit: async v => { const b64 = await readB64(v.file); put(DB.docs, await api('replaceDoc', { id: d.id, fileName: v.file.name, mimeType: v.file.type, base64: b64 })); touch(ui.pid); } }),
+  editDoc: d => { const x = doc(d.id); form({ title: 'Edit document info', fields: [{ k: 'name', label: 'Name', required: true, value: x.name }, { k: 'category', label: 'Category', type: 'select', options: DOC_CATS, value: x.category }, { k: 'note', label: 'Note', type: 'textarea', rows: 2, value: x.note }],
+    onSubmit: async v => { v.id = x.id; put(DB.docs, await api('saveDocInfo', v)); touch(ui.pid); } }); },
+  delDoc: async d => { if (await confirmBox('Delete “' + doc(d.id).name + '”? The file moves to your Drive trash.')) run(api('deleteDoc', d.id).then(() => { DB.docs = DB.docs.filter(x => x.id !== d.id); touch(ui.pid); }), 'Deleted'); }
+};
+document.addEventListener('click', e => { const el = e.target.closest('[data-a]'); if (el && A[el.dataset.a]) { e.preventDefault(); A[el.dataset.a](el.dataset); } });
+document.addEventListener('change', e => { if (e.target.matches('[data-phase]')) run(saveItem({ id: e.target.dataset.id, status: e.target.value })); });
+document.addEventListener('submit', e => {
+  if (e.target.id !== 'quick') return;
+  e.preventDefault();
+  const f = e.target, v = n => f.querySelector('[name=' + n + ']').value;
+  run(api('saveProject', { id: ui.pid, status: v('status'), priority: v('priority'), state: v('state'), nextAction: v('nextAction') }).then(r => put(DB.projects, r)), 'Saved');
+});
+
+let st; $('#q').addEventListener('input', e => { ui.q = e.target.value; clearTimeout(st); st = setTimeout(render, 150); });
+api('getData').then(d => {
+  DB = d; render();
+  const a = $('#sheetLink'); a.href = d.sheetUrl; a.hidden = false;
+}).catch(e => { $('#app').innerHTML = `<div class="empty">Could not load data: ${esc(e.message)}<br><br><button class="btn" onclick="location.reload()">Try again</button></div>`; });
+})();
+</script>
